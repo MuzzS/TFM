@@ -1,0 +1,171 @@
+
+
+// Función para limpiar el string y convertirlo a número
+function parseCoordinate(coordStr) {
+  // Eliminar puntos que se usan como separador de miles.
+  // IMPORTANTE: Si el separador decimal es una coma, deberás reemplazarla por punto.
+  // En este ejemplo se asume que todos los puntos son separadores de miles, 
+  // lo que puede requerir ajustar la función según tu caso.
+  var limpio = ee.String(coordStr).replace(',', '.', "g");
+  // Aquí se asume que el número debe dividirse por 1e6 para recuperar el valor decimal.
+  // Ajusta el factor de conversión según el formato de tus datos.
+  return ee.Number.parse(limpio)
+}
+
+var puntos = table.map(function(feature) {
+  var lat = parseCoordinate(feature.get('lat_decimal'));
+  var lon = parseCoordinate(feature.get('lon_decimal'));
+  // Crear la geometría del punto
+  return feature.setGeometry(ee.Geometry.Point(lon, lat));
+});
+
+// Opcional: imprimir el primer feature para verificar la geometría
+print('Primer feature con geometría:', puntos.first());
+
+// 1. Definir la colección de imágenes y fechas
+var imageCollection = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterDate('2018-01-01', '2024-12-31');
+
+// 2. Función para calcular índices en cada imagen
+function indexes(img) {
+  var ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  img = img.addBands(ndvi);
+  
+  var a_ar = img.expression('(sqrt((664.7-560)**2 + (B4-B3)**2))', {
+    'B4': img.select('B4'),
+    'B3': img.select('B3')
+  }).rename('a_Ar');
+  var b_ar = img.expression('(sqrt((835-664.7)**2 + (B8-B4)**2))', {
+    'B8': img.select('B8'),
+    'B4': img.select('B4')
+  }).rename('b_Ar');
+  var c_ar = img.expression('(sqrt((835-560)**2 + (B8-B3)**2))', {
+    'B8': img.select('B8'),
+    'B3': img.select('B3')
+  }).rename('c_Ar');
+  var ar = img.expression(
+    '(a_Ar**2 + b_Ar**2 - c_Ar**2) / (2 * a_Ar * b_Ar)', {
+      'a_Ar': a_ar,
+      'b_Ar': b_ar,
+      'c_Ar': c_ar
+    }
+  ).clamp(-1,1).acos().rename('AR');
+  img = img.addBands(ar);
+  
+  // Cálculo de AS1
+  var a_as1 = img.expression('(sqrt((1613.7-835)**2 + (B11-B8)**2))', {
+    'B11': img.select('B11'),
+    'B8': img.select('B8')
+  }).rename('a_AS1');
+  var b_as1 = img.expression('(sqrt((1613.7-2202)**2 + (B11-B12)**2))', {
+    'B11': img.select('B11'),
+    'B12': img.select('B12')
+  }).rename('b_AS1');
+  var c_as1 = img.expression('(sqrt((2202-835)**2 + (B12-B8)**2))', {
+    'B12': img.select('B12'),
+    'B8': img.select('B8')
+  }).rename('c_AS1');
+  var as1 = img.expression(
+    '(a_AS1**2 + b_AS1**2 - c_AS1**2) / (2 * a_AS1 * b_AS1)', {
+      'a_AS1': a_as1,
+      'b_AS1': b_as1,
+      'c_AS1': c_as1
+    }
+  ).clamp(-1,1).acos().rename('AS1');
+  img = img.addBands(as1);
+  
+  // Máscara de calidad (opcional)
+  var quality = img.select('SCL');
+  var mask = quality.eq(8).or(quality.eq(9))
+              .or(quality.eq(10)).or(quality.eq(11))
+              .or(quality.eq(3)).or(quality.eq(2))
+              .or(quality.eq(1)).or(quality.eq(0));
+  var condition = mask.eq(0).not();
+  img = img.where(condition, 0);
+  
+  return img;
+}
+
+// 3. Función para procesar un punto y extraer la serie de tiempo para el índice solicitado
+// indexName debe ser 'NDVI', 'AR' o 'AS1'
+function processPointForIndex(feature, indexName) {
+  // Usamos un buffer pequeño alrededor del punto
+  var geometry = feature.geometry().buffer(50);
+  
+  // Filtrar la colección por el área y las fechas
+  var images = imageCollection.filterBounds(geometry)
+                  .filterDate('2018-01-01', '2024-12-31');
+  
+  // Verificar que existan imágenes en la zona. Si no, la lista de tiles quedará vacía.
+  var tiles = images.aggregate_array('MGRS_TILE').distinct();
+  // Sólo continuamos si hay al menos un tile
+  images = ee.Algorithms.If(
+    tiles.size().gt(0),
+    images.filter(ee.Filter.eq('MGRS_TILE', tiles.get(0))),
+    images // o devolver una colección vacía
+  );
+  images = ee.ImageCollection(images);
+  
+  var orbits = images.aggregate_array('SENSING_ORBIT_NUMBER').distinct();
+  images = ee.Algorithms.If(
+    orbits.size().gt(0),
+    images.filter(ee.Filter.eq('SENSING_ORBIT_NUMBER', orbits.get(0))),
+    images
+  );
+  images = ee.ImageCollection(images);
+  
+  // Calcular índices y seleccionar el índice solicitado
+  images = images.map(indexes).select(indexName);
+  
+  // Extraer la fecha y el valor medio del índice en el área del punto para cada imagen
+  var ts = images.map(function(img) {
+    var date = img.date().format('YYYY-MM-dd');
+    var stats = img.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: geometry,
+      scale: 10,
+      maxPixels: 1e9
+    });
+    return ee.Feature(null, {
+      'point_id': feature.get('system:index'),
+      'date': date,
+      'value': stats.get(indexName)
+    });
+  });
+  return ts;
+}
+
+// 4. Generar tres colecciones: una para cada índice
+var ndviCollection = puntos.map(function(feature) {
+  return processPointForIndex(feature, 'NDVI');
+}).flatten();
+
+var arCollection = puntos.map(function(feature) {
+  return processPointForIndex(feature, 'AR');
+}).flatten();
+
+var as1Collection = puntos.map(function(feature) {
+  return processPointForIndex(feature, 'AS1');
+}).flatten();
+
+// 5. Exportar cada FeatureCollection a un CSV distinto
+Export.table.toDrive({
+  collection: ndviCollection,
+  description: 'TimeSeries_NDVI',
+  fileNamePrefix: 'TimeSeries_NDVI',
+  fileFormat: 'CSV'
+});
+
+Export.table.toDrive({
+  collection: arCollection,
+  description: 'TimeSeries_AR',
+  fileNamePrefix: 'TimeSeries_AR',
+  fileFormat: 'CSV'
+});
+
+Export.table.toDrive({
+  collection: as1Collection,
+  description: 'TimeSeries_AS1',
+  fileNamePrefix: 'TimeSeries_AS1',
+  fileFormat: 'CSV'
+});
